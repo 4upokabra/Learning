@@ -1,49 +1,121 @@
-# main.py
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
-from database import engine, Base, get_db
-from models import User, Product, Order
-from schemas import UserCreate, ProductCreate, OrderCreate
+import os
+import aiohttp
+import asyncio
+import logging
+import subprocess
+from dotenv import load_dotenv
+from telethon import TelegramClient, events, Button
+from datetime import datetime
 
-Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+# Загрузка переменных окружения из файла .env
+load_dotenv()
 
-@app.post("/users/", response_model=User)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = User(**user.dict())
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+# Ваши данные для авторизации
+api_id = os.getenv('API_ID')
+api_hash = os.getenv('API_HASH')
+bot_token = os.getenv('BOT_TOKEN')
+backend_url = os.getenv('BACKEND_URL')
 
-@app.post("/products/", response_model=Product)
-def create_product(product: ProductCreate, db: Session = Depends(get_db)):
-    db_product = Product(**product.dict())
-    db.add(db_product)
-    db.commit()
-    db.refresh(db_product)
-    return db_product
+# Белый список пользователей
+whitelist = [int(user_id) for user_id in os.getenv('WHITELIST', '').split(',') if user_id.isdigit()]
 
-@app.post("/orders/", response_model=Order)
-def create_order(order: OrderCreate, db: Session = Depends(get_db)):
-    db_order = Order(**order.dict())
-    db.add(db_order)
-    db.commit()
-    db.refresh(db_order)
-    return db_order
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@app.get("/users/", response_model=list[User])
-def read_users(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    users = db.query(User).offset(skip).limit(limit).all()
-    return users
+# Инициализация клиента
+client = TelegramClient('bot', api_id, api_hash).start(bot_token=bot_token)
 
-@app.get("/products/", response_model=list[Product])
-def read_products(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    products = db.query(Product).offset(skip).limit(limit).all()
-    return products
+# Функция для создания папки пользователя
+def create_user_folder(user_id):
+    user_folder = f'users/{user_id}'
+    if not os.path.exists(user_folder):
+        os.makedirs(user_folder)
+    return user_folder
 
-@app.get("/orders/", response_model=list[Order])
-def read_orders(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    orders = db.query(Order).offset(skip).limit(limit).all()
-    return orders
+# Функция для проверки пользователя в белом списке
+def is_whitelisted(user_id):
+    return user_id in whitelist
+
+# Обработчик для команды /start
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    user_id = event.sender_id
+    if is_whitelisted(user_id):
+        await event.respond('''
+Привет! Этот бот позволяет сохранять и управлять файлами.
+
+Команды:
+- /list: Показать список сохраненных файлов.
+- Отправьте файл, чтобы сохранить его.
+
+Пожалуйста, отправьте файл или используйте команду /list для просмотра сохраненных файлов.
+''')
+    else:
+        await event.respond('Извините, у вас нет доступа к этому боту.')
+
+# Обработчик для получения файлов
+@client.on(events.NewMessage(func=lambda e: e.file))
+async def handle_file(event):
+    user_id = event.sender_id
+    if is_whitelisted(user_id):
+        user_folder = create_user_folder(user_id)
+
+        # Получаем файл
+        file_name = event.file.name
+        file_type = event.file.mime_type
+        if file_name is None:
+            file_name = f'file_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+
+        file_path = await event.download_media(file=os.path.join(user_folder, file_name))
+        if file_type == 'application/x-python-code':
+            try:
+                subprocess.run(['python', file_path], check=True)
+                logger.info(f"Message with file from user {user_id} successfully started")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Error executing file from user {user_id}: {e}")
+                await event.respond(f'Ошибка при выполнении файла: {e}')
+        await event.respond(f'Файл сохранен: {file_path}')
+        await client.delete_messages(event.chat_id, event.message.id)
+        logger.info(f"Message with file from user {user_id} deleted")
+    else:
+        await event.respond('Извините, у вас нет доступа к этому боту.')
+
+# Обработчик для команды просмотра файлов
+@client.on(events.NewMessage(pattern='/list'))
+async def list_files(event):
+    user_id = event.sender_id
+    if is_whitelisted(user_id):
+        user_folder = create_user_folder(user_id)
+
+        files = os.listdir(user_folder)
+        if files:
+            buttons = []
+            for file in files:
+                buttons.append(Button.inline(file, data=f'download_{file}'))
+            await event.respond('Ваши файлы:', buttons=buttons)
+        else:
+            await event.respond('У вас нет сохраненных файлов.')
+    else:
+        await event.respond('Извините, у вас нет доступа к этому боту.')
+
+# Обработчик для команды скачивания файла
+@client.on(events.CallbackQuery(pattern=r'download_(.+)'))
+async def download_file(event):
+    user_id = event.sender_id
+    if is_whitelisted(user_id):
+        user_folder = create_user_folder(user_id)
+        file_name = event.pattern_match.group(1).decode('utf-8')  # Преобразование байтовой строки в обычную строку
+        file_path = os.path.join(user_folder, file_name)
+
+        if os.path.exists(file_path):
+            message = await event.respond(file=file_path)
+            await asyncio.sleep(15)  # Задержка на 15 секунд
+            await client.delete_messages(event.chat_id, message.id)
+        else:
+            await event.respond('Файл не найден.')
+    else:
+        await event.respond('Извините, у вас нет доступа к этому боту.')
+
+client.run_until_disconnected()
